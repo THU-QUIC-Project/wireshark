@@ -44,13 +44,12 @@
  */
 #include <config.h>
 
+#include <epan/conversation.h>
 #include <epan/packet.h>
 #include <epan/expert.h>
 #include <epan/proto_data.h>
 #include <epan/to_str.h>
-#include "packet-tls-utils.h"
-#include "packet-tls.h"
-#include "packet-tcp.h"     /* used for STREAM reassembly. */
+// #include "packet-tcp.h"     /* used for STREAM reassembly. */
 #include "packet-quic.h"
 #include <epan/reassemble.h>
 #include <epan/prefs.h>
@@ -59,6 +58,40 @@
 #include <epan/tap.h>
 #include <epan/follow.h>
 #include <epan/addr_resolv.h>
+
+struct tcp_multisegment_pdu {
+	guint32 seq;
+	guint32 nxtpdu;
+	guint32 first_frame;            /* The frame where this MSP was created (used as key in reassembly tables). */
+	guint32 last_frame;
+	nstime_t last_frame_time;
+	guint32 first_frame_with_seq;   /* The frame that contains the first frame that matches 'seq'
+					   (same as 'first_frame', larger than 'first_frame' for OoO segments) */
+	guint32 flags;
+#define MSP_FLAGS_REASSEMBLE_ENTIRE_SEGMENT	0x00000001
+/* Whether this MSP is finished and no more segments can be added. */
+#define MSP_FLAGS_GOT_ALL_SEGMENTS		0x00000002
+/* Whether the first segment of this MSP was not yet seen. */
+#define MSP_FLAGS_MISSING_FIRST_SEGMENT		0x00000004
+};
+
+static struct tcp_multisegment_pdu *
+pdu_store_sequencenumber_of_next_pdu(packet_info *pinfo, guint32 seq, guint32 nxtpdu, wmem_tree_t *multisegment_pdus)
+{
+    struct tcp_multisegment_pdu *msp;
+
+    msp=wmem_new(wmem_file_scope(), struct tcp_multisegment_pdu);
+    msp->nxtpdu=nxtpdu;
+    msp->seq=seq;
+    msp->first_frame=pinfo->num;
+    msp->first_frame_with_seq=pinfo->num;
+    msp->last_frame=pinfo->num;
+    msp->last_frame_time=pinfo->abs_ts;
+    msp->flags=0;
+    wmem_tree_insert32(multisegment_pdus, seq, (void *)msp);
+    /*ws_warning("pdu_store_sequencenumber_of_next_pdu: seq %u", seq);*/
+    return msp;
+}
 
 /* Prototypes */
 void proto_reg_handoff_quic(void);
@@ -150,7 +183,6 @@ static int hf_quic_path_challenge_data = -1;
 static int hf_quic_path_response_data = -1;
 static int hf_quic_cc_error_code = -1;
 static int hf_quic_cc_error_code_app = -1;
-static int hf_quic_cc_error_code_tls_alert = -1;
 static int hf_quic_cc_frame_type = -1;
 static int hf_quic_cc_reason_phrase_length = -1;
 static int hf_quic_cc_reason_phrase = -1;
@@ -1891,12 +1923,6 @@ dissect_quic_frame_type(tvbuff_t *tvb, packet_info *pinfo, proto_tree *quic_tree
 
             if (frame_type == FT_CONNECTION_CLOSE_TPT) {
                 proto_tree_add_item_ret_varint(ft_tree, hf_quic_cc_error_code, tvb, offset, -1, ENC_VARINT_QUIC, &error_code, &len_error_code);
-                if ((error_code >> 8) == 1) {  // CRYPTO_ERROR (0x1XX)
-                    tls_alert = try_val_to_str(error_code & 0xff, ssl_31_alert_description);
-                    if (tls_alert) {
-                        proto_tree_add_item(ft_tree, hf_quic_cc_error_code_tls_alert, tvb, offset + len_error_code - 1, 1, ENC_BIG_ENDIAN);
-                    }
-                }
                 offset += len_error_code;
 
                 proto_tree_add_item_ret_varint(ft_tree, hf_quic_cc_frame_type, tvb, offset, -1, ENC_VARINT_QUIC, NULL, &len_frametype);
@@ -3754,11 +3780,6 @@ proto_register_quic(void)
             { "Application Error code", "quic.cc.error_code.app",
               FT_UINT64, BASE_DEC, NULL, 0x0,
               "Indicates the reason for closing this application", HFILL }
-        },
-        { &hf_quic_cc_error_code_tls_alert,
-            { "TLS Alert Description", "quic.cc.error_code.tls_alert",
-              FT_UINT8, BASE_DEC, VALS(ssl_31_alert_description), 0x0,
-              NULL, HFILL }
         },
         { &hf_quic_cc_frame_type,
             { "Frame Type", "quic.cc.frame_type",
